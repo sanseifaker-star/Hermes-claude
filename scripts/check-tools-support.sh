@@ -58,15 +58,54 @@ RESPONSE=$(curl -sS -w $'\n%{http_code}' "${BASE_URL}/chat/completions" \
 HTTP_CODE=$(printf '%s' "$RESPONSE" | tail -n1)
 BODY=$(printf '%s' "$RESPONSE" | sed '$d')
 
-if [ "$HTTP_CODE" != "200" ]; then
-  echo "FAIL — HTTP ${HTTP_CODE}"
-  echo
-  echo "$BODY"
-  echo
-  echo "Endpoint не принял запрос с 'tools'. Агент на нём работать не будет."
-  echo "Ищите другого провайдера или другой endpoint у этого же."
-  exit 1
-fi
+case "$HTTP_CODE" in
+  200) ;;
+  401|403)
+    echo "FAIL — HTTP ${HTTP_CODE}: проблема с ключом, не с tools."
+    echo
+    echo "$BODY"
+    echo
+    echo "Ключ неверный, истёк, или у него нет доступа к этой модели."
+    echo "Проверьте ключ в личном кабинете провайдера и повторите."
+    exit 1
+    ;;
+  402)
+    echo "FAIL — HTTP 402: недостаточно средств."
+    echo
+    echo "$BODY"
+    exit 1
+    ;;
+  429)
+    echo "FAIL — HTTP 429: rate limit. Это временно."
+    echo
+    echo "$BODY"
+    echo
+    echo "Подождите минуту и повторите — о поддержке tools это ничего не говорит."
+    exit 1
+    ;;
+  404)
+    echo "FAIL — HTTP 404: endpoint или модель не найдены."
+    echo
+    echo "$BODY"
+    echo
+    echo "Проверьте base_url (нужен путь до /v1, если провайдер его требует)"
+    echo "и точное имя модели."
+    exit 1
+    ;;
+  *)
+    echo "FAIL — HTTP ${HTTP_CODE}"
+    echo
+    echo "$BODY"
+    echo
+    if printf '%s' "$BODY" | grep -qi 'tool'; then
+      echo "В ответе упоминаются tools — похоже, endpoint их не поддерживает."
+      echo "Агент на нём работать не будет, ищите другого провайдера."
+    else
+      echo "Ошибка не похожа на проблему с tools — разберите текст выше."
+    fi
+    exit 1
+    ;;
+esac
 
 # 200 — но надо убедиться, что модель реально вызвала инструмент, а не
 # отписалась текстом. Провайдер может принять параметр и молча его выбросить.
