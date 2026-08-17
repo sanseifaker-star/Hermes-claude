@@ -1,171 +1,185 @@
 #!/usr/bin/env bash
 #
-# Hardened installer for Hermes Agent (github.com/NousResearch/hermes-agent)
-# as a self-hosted personal Telegram assistant.
+# Установка Hermes Agent (github.com/NousResearch/hermes-agent) как личного
+# ассистента в Telegram. Ставится от root, на чистую Ubuntu 24.04 LTS.
 #
-# Run this yourself, on your server, as root:
-#   sudo bash scripts/install-hermes.sh
+# Запускать на сервере:
+#   bash scripts/install-hermes.sh
 #
-# It does NOT run automatically from anywhere else. Read
-# docs/SECURITY-CHECKLIST.md first.
+# Учитывает грабли из docs/TROUBLESHOOTING.md — прочитайте, если что-то
+# пойдёт не так.
 #
 set -euo pipefail
 
-HERMES_USER="hermes"
 INSTALL_DOMAIN="hermes-agent.nousresearch.com"
 OFFICIAL_REPO="https://github.com/NousResearch/hermes-agent"
+NODE_MAJOR_OK=22
 
 log()  { printf '\n\033[1;32m==>\033[0m %s\n' "$1"; }
 warn() { printf '\n\033[1;33m/!\\\033[0m %s\n' "$1"; }
 die()  { printf '\n\033[1;31mERROR:\033[0m %s\n' "$1" >&2; exit 1; }
 
-[ "$(id -u)" -eq 0 ] || die "Run this with sudo/root (it needs to create a system user and configure the firewall)."
-
-command -v curl >/dev/null 2>&1 || { apt-get update -y && apt-get install -y curl; }
-
-warn "This installs Hermes Agent ONLY from the official source: ${OFFICIAL_REPO}"
-warn "and the official installer domain: https://${INSTALL_DOMAIN}/install.sh"
-warn "There are known malvertising campaigns impersonating this project"
-warn "(fake Google ads, fake F-Droid listing). Do not run install commands"
-warn "from any other source for this project."
-read -r -p "Continue with install from the official source? [y/N] " confirm
-[ "${confirm:-N}" = "y" ] || [ "${confirm:-N}" = "Y" ] || die "Aborted by user."
+[ "$(id -u)" -eq 0 ] || die "Запускать от root."
 
 # ---------------------------------------------------------------------------
-# 1. Dedicated non-root user. The agent gets shell/file access per the
-#    upstream security audit (NousResearch/hermes-agent#7826, findings
-#    C1/C2) — it must not run as root, and must not be a passwordless
-#    sudoer either.
+# 0. Предупреждение об источнике. Существуют кампании малвертайзинга под
+#    видом установки Hermes Agent (фейковая Google-реклама с PowerShell-
+#    однострочником, фейковый листинг на F-Droid). Доверенных источников два.
 # ---------------------------------------------------------------------------
-if id "$HERMES_USER" >/dev/null 2>&1; then
-  log "User '$HERMES_USER' already exists, reusing it."
-else
-  log "Creating dedicated non-root user '$HERMES_USER' (no sudo group membership)."
-  adduser --disabled-password --gecos "Hermes Agent service user" "$HERMES_USER"
-fi
+warn "Ставим ТОЛЬКО из официальных источников:"
+warn "  репозиторий:  ${OFFICIAL_REPO}"
+warn "  инсталлятор:  https://${INSTALL_DOMAIN}/install.sh"
+warn "Никаких других ссылок для этого проекта не существует."
+read -r -p "Продолжить? [y/N] " confirm
+case "${confirm:-N}" in
+  y|Y) ;;
+  *) die "Отменено." ;;
+esac
 
-# Give it access to docker (added below) but NOT to sudo/root.
-usermod -aG docker "$HERMES_USER" 2>/dev/null || true
-
 # ---------------------------------------------------------------------------
-# 2. Docker, for running the agent's terminal backend containerized instead
-#    of directly against the host (reduces blast radius per audit finding
-#    C1/H7 — note the audit also flags that container-backend approval
-#    checks are currently bypassed unconditionally (C3), so this is
-#    defense-in-depth, not a full fix).
+# 1. Версия ОС. На Ubuntu 26.04 Playwright не поддерживается, Chromium
+#    ставится только через PLAYWRIGHT_HOST_PLATFORM_OVERRIDE, а Node 26
+#    вешает установку на этапе распаковки.
 # ---------------------------------------------------------------------------
-if ! command -v docker >/dev/null 2>&1; then
-  log "Installing Docker Engine."
-  curl -fsSL https://get.docker.com | sh
-  systemctl enable --now docker
-else
-  log "Docker already installed."
+OS_VERSION=$(. /etc/os-release && echo "${VERSION_ID:-unknown}")
+log "Ubuntu ${OS_VERSION}"
+if [ "$OS_VERSION" = "26.04" ]; then
+  warn "Ubuntu 26.04: Playwright её официально не поддерживает."
+  warn "Браузерные инструменты потребуют обходов — см. docs/TROUBLESHOOTING.md."
+  warn "Рекомендуется 24.04 LTS."
+  read -r -p "Всё равно продолжить? [y/N] " c2
+  case "${c2:-N}" in y|Y) ;; *) die "Отменено." ;; esac
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Firewall: allow inbound SSH only. Telegram gateway uses outbound
-#    long-polling, so no inbound ports are required for the bot itself.
+# 2. Базовые зависимости. ffmpeg нужен для голосовых в Telegram — без него
+#    инсталлятор Hermes просто предупреждает и идёт дальше, а голос потом
+#    молча не работает.
+# ---------------------------------------------------------------------------
+log "Ставим базовые пакеты (curl, ripgrep, ffmpeg)."
+apt-get update -y
+apt-get install -y curl ripgrep ffmpeg
+
+# ---------------------------------------------------------------------------
+# 3. Файрвол: внутрь только SSH. Telegram работает исходящим long-polling,
+#    входящие порты для бота не нужны.
 # ---------------------------------------------------------------------------
 if command -v ufw >/dev/null 2>&1; then
-  log "Configuring firewall (ufw): allow SSH only, deny other inbound."
+  log "Файрвол: разрешаем только SSH."
   ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp
   ufw --force enable
 else
-  warn "ufw not found — skipping firewall setup. Configure one manually" \
-       "(the server should not expose any inbound port besides SSH)."
+  warn "ufw не найден — настройте файрвол вручную."
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Install Hermes Agent itself, as the unprivileged user, from the
-#    official installer only.
+# 4. Собственно Hermes.
 # ---------------------------------------------------------------------------
-log "Installing Hermes Agent as user '$HERMES_USER' from https://${INSTALL_DOMAIN}/install.sh"
-sudo -u "$HERMES_USER" -H bash -c "curl -fsSL https://${INSTALL_DOMAIN}/install.sh | bash"
+log "Ставим Hermes Agent."
+curl -fsSL "https://${INSTALL_DOMAIN}/install.sh" | bash
 
-HERMES_HOME=$(getent passwd "$HERMES_USER" | cut -d: -f6)
-REPO_CHECKOUT="${HERMES_HOME}/.hermes/hermes-agent"
+export PATH="/usr/local/bin:${PATH}"
+command -v hermes >/dev/null 2>&1 || {
+  # shellcheck disable=SC1091
+  [ -f /root/.bashrc ] && source /root/.bashrc || true
+}
 
-if [ -d "$REPO_CHECKOUT/.git" ]; then
-  PINNED_COMMIT=$(sudo -u "$HERMES_USER" git -C "$REPO_CHECKOUT" rev-parse HEAD)
-  log "Installed hermes-agent at commit: ${PINNED_COMMIT}"
-  echo "$PINNED_COMMIT" | sudo -u "$HERMES_USER" tee "${HERMES_HOME}/.hermes/INSTALLED_COMMIT" >/dev/null
-  warn "Record this commit. Review the diff before ever running 'hermes update' (audit finding H9)."
+# ---------------------------------------------------------------------------
+# 5. Node. Hermes держит свой Node в ~/.hermes/node. Если туда приехал 26 —
+#    Playwright повиснет на "extracting archive" навсегда.
+# ---------------------------------------------------------------------------
+HERMES_NODE="/root/.hermes/node/bin/node"
+if [ -x "$HERMES_NODE" ]; then
+  NODE_VER=$("$HERMES_NODE" --version)
+  NODE_MAJOR=$(echo "$NODE_VER" | sed 's/^v\([0-9]*\).*/\1/')
+  log "Node у Hermes: ${NODE_VER}"
+  if [ "$NODE_MAJOR" -gt "$NODE_MAJOR_OK" ]; then
+    warn "Node ${NODE_MAJOR} ломает установку Chromium."
+    warn "См. docs/TROUBLESHOOTING.md — раздел про подмену на Node 22."
+  fi
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Show the REAL current CLI help so you can verify exact flag names for
-#    the audit-relevant settings before relying on them. Flag names may
-#    have changed since the audit (v0.8.0) — do not trust anyone's memory
-#    of them, including this script's, verify on your installed version.
+# 6. Пользовательский systemd-юнит. Hermes ставит свой в ~/.config/systemd/
+#    user/. Если поверх завести системный с тем же именем, они начнут делить
+#    блокировку шлюза и устроят respawn storm, который не виден ни в
+#    /etc/systemd/system/, ни в дереве процессов.
 # ---------------------------------------------------------------------------
-log "Below is the live --help output from your installed version."
-log "Cross-check it against docs/SECURITY-CHECKLIST.md before proceeding."
-sudo -u "$HERMES_USER" -H bash -lc "hermes --help" || true
-echo
-sudo -u "$HERMES_USER" -H bash -lc "hermes config --help" || true
+log "Проверяем пользовательский systemd-юнит."
+if systemctl --user list-unit-files 2>/dev/null | grep -q hermes-gateway; then
+  warn "Hermes завёл свой пользовательский юнит hermes-gateway.service."
+  warn "Он будет конфликтовать с системным. Гасим его."
+  systemctl --user stop hermes-gateway 2>/dev/null || true
+  systemctl --user disable hermes-gateway 2>/dev/null || true
+  log "Пользовательский юнит отключён."
+else
+  log "Пользовательского юнита нет — конфликта не будет."
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Системный юнит. Флаг --replace обязателен: без него, если экземпляр уже
+#    запущен, gateway run выходит с кодом 1 и systemd уходит в цикл.
+# ---------------------------------------------------------------------------
+UNIT_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/hermes-config/hermes-gateway.service"
+if [ -f "$UNIT_SRC" ]; then
+  log "Ставим системный юнит."
+  cp "$UNIT_SRC" /etc/systemd/system/hermes-gateway.service
+  systemctl daemon-reload
+  systemctl enable hermes-gateway
+  log "Юнит установлен и включён (запустим после настройки модели)."
+else
+  warn "Юнит не найден: ${UNIT_SRC} — поставьте вручную."
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Персона.
+# ---------------------------------------------------------------------------
+SOUL_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/hermes-config/SOUL.md"
+if [ -f "$SOUL_SRC" ]; then
+  log "Кладём персону в /root/.hermes/SOUL.md"
+  mkdir -p /root/.hermes
+  cp "$SOUL_SRC" /root/.hermes/SOUL.md
+fi
+
+# ---------------------------------------------------------------------------
+# 9. Фиксируем коммит — чтобы не обновляться вслепую.
+# ---------------------------------------------------------------------------
+for d in /root/.hermes/hermes-agent /usr/local/lib/hermes-agent; do
+  if [ -d "$d/.git" ]; then
+    C=$(git -C "$d" rev-parse HEAD 2>/dev/null || true)
+    [ -n "$C" ] && { echo "$C" > /root/.hermes/INSTALLED_COMMIT; log "Коммит: ${C}"; }
+  fi
+done
 
 cat <<'EOF'
 
 ===============================================================================
-NEXT STEPS — run these yourself, interactively, as the 'hermes' user:
+ДАЛЬШЕ — вручную:
 
-    sudo -iu hermes
+  1. Провайдер модели. СНАЧАЛА проверьте, что он умеет tool-calling:
 
-Then, on this server (never paste tokens/API keys into a chat with Claude):
+       ./scripts/check-tools-support.sh <base_url> <model> <api_key>
 
-  1. hermes setup            # or: hermes model  — pick your model provider
-                              # (recommended: Anthropic Claude — enter your
-                              #  Anthropic API key when prompted)
+     Без tools агент не сможет ни писать файлы, ни выполнять команды — и
+     при этом будет уверенно рапортовать об успехе. Это не теория, мы на
+     это уже наступили.
 
-  2. hermes gateway setup    # configure the Telegram bot:
-                              #  - paste your @BotFather token when asked
-                              #  - enable DM pairing / restrict to your own
-                              #    Telegram user ID — do NOT leave it open
-                              #    to arbitrary users
+  2. hermes model        — выбрать провайдера и модель
+  3. hermes gateway setup — токен бота от @BotFather, привязка к вашему
+                            Telegram ID (DM pairing). Не оставляйте бота
+                            открытым для всех: у него root на этой машине.
 
-  3. Before starting, go through docs/SECURITY-CHECKLIST.md "During install"
-     section and verify (using the --help output above) that:
-       - YOLO / skip-approval mode is OFF
-       - smart/auto-approval is OFF (approvals require your confirmation)
-       - a write-safe-root / sandbox path is configured, not full filesystem
-         access
-       - the terminal backend is Docker/Singularity/Modal, not 'local',
-         if you want the container isolation layer
+  4. Запуск:
+       systemctl start hermes-gateway
+       systemctl status hermes-gateway --no-pager
 
-  4. hermes gateway start    # or install as a systemd service (see below)
-                              # so it survives reboots/SSH disconnects
+  5. Боевая проверка, что руки работают. Напишите боту в Telegram:
+       запиши строку TEST-1 в /root/.hermes/probe.txt
+     Затем на сервере:
+       cat /root/.hermes/probe.txt
+     Пусто — значит tools не работают, возвращайтесь к пункту 1.
 
-Optional systemd service (run as root), so the gateway persists and runs
-as the unprivileged 'hermes' user:
-
-    cat > /etc/systemd/system/hermes-gateway.service <<'UNIT'
-    [Unit]
-    Description=Hermes Agent Telegram Gateway
-    After=network-online.target docker.service
-    Wants=network-online.target
-
-    [Service]
-    Type=simple
-    User=hermes
-    Group=hermes
-    WorkingDirectory=/home/hermes
-    ExecStart=/home/hermes/.local/bin/hermes gateway start
-    Restart=on-failure
-    RestartSec=5
-    NoNewPrivileges=true
-    ProtectSystem=strict
-    ProtectHome=read-only
-    ReadWritePaths=/home/hermes/.hermes
-    MemoryMax=2G
-
-    [Install]
-    WantedBy=multi-user.target
-    UNIT
-
-    systemctl daemon-reload
-    systemctl enable --now hermes-gateway
-
-(Adjust ExecStart path if 'which hermes' as the hermes user shows a
-different location.)
+ПОМНИТЕ: агент работает от root и принимает команды из Telegram. Кто
+получит доступ к боту — получит сервер. Держите DM pairing включённым.
 ===============================================================================
 EOF
