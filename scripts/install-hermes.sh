@@ -14,7 +14,6 @@ set -euo pipefail
 INSTALL_URL="https://hermes-agent.nousresearch.com/install.sh"
 INSTALL_URL_ALT="https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh"
 OFFICIAL_REPO="https://github.com/NousResearch/hermes-agent"
-NODE_MAJOR_OK=22
 
 log()  { printf '\n\033[1;32m==>\033[0m %s\n' "$1"; }
 warn() { printf '\n\033[1;33m/!\\\033[0m %s\n' "$1"; }
@@ -49,9 +48,12 @@ fi
 # 2. Зависимости. Инсталлятор Hermes ставит их сам, но ffmpeg при неудаче
 #    только предупреждает — и голосовые в Telegram потом молча не работают.
 # ---------------------------------------------------------------------------
+# libatomic1 — без неё Node не запускается вообще ("error while loading
+# shared libraries: libatomic.so.1"), и установщик Hermes встаёт на этапе
+# проверки Node. На минимальном образе Ubuntu 24.04 её нет.
 log "Базовые пакеты."
 apt-get update -y
-apt-get install -y curl ripgrep ffmpeg
+apt-get install -y curl ripgrep ffmpeg libatomic1
 
 # ---------------------------------------------------------------------------
 # 3. Файрвол: внутрь только SSH. Telegram работает исходящим long-polling.
@@ -83,16 +85,20 @@ log "Штатная самодиагностика:"
 hermes doctor || warn "hermes doctor вернул ошибки — разберите их до настройки."
 
 # ---------------------------------------------------------------------------
-# 5. Node. Hermes держит свой в ~/.hermes/node. Node 26 вешает установку
-#    Chromium на "extracting archive" навсегда.
+# 5. Node. Hermes ставит и держит свой в ~/.hermes/node и ТРЕБУЕТ Node >=26.
+#    Понижать его нельзя — сломается сам Hermes.
+#
+#    При этом Playwright на Node 26 может зависать на "extracting archive"
+#    при установке Chromium. Это конфликт апстримов, не ошибка установки:
+#    браузерные инструменты чиним отдельно, Node не трогаем.
 # ---------------------------------------------------------------------------
 HERMES_NODE="/root/.hermes/node/bin/node"
 if [ -x "$HERMES_NODE" ]; then
-  NODE_VER=$("$HERMES_NODE" --version)
-  NODE_MAJOR=$(echo "$NODE_VER" | sed 's/^v\([0-9]*\).*/\1/')
-  log "Node у Hermes: ${NODE_VER}"
-  [ "$NODE_MAJOR" -gt "$NODE_MAJOR_OK" ] && \
-    warn "Node ${NODE_MAJOR} ломает установку Chromium — см. docs/TROUBLESHOOTING.md"
+  if NODE_VER=$("$HERMES_NODE" --version 2>/dev/null); then
+    log "Node у Hermes: ${NODE_VER}"
+  else
+    warn "Node установлен, но не запускается — проверьте libatomic1."
+  fi
 fi
 
 # ---------------------------------------------------------------------------
