@@ -1,3 +1,18 @@
+# НЕ ИСПОЛЬЗОВАТЬ ПО УМОЛЧАНИЮ.
+#
+# Штатный способ автозапуска — `hermes gateway install` (ставит
+# пользовательский сервис) плюс `loginctl enable-linger root`, чтобы он
+# переживал перезагрузку.
+#
+# Этот системный юнит конфликтует со штатным пользовательским: оба борются
+# за блокировку шлюза и устраивают respawn storm, который не виден ни в
+# /etc/systemd/system/, ни в дереве процессов. См. docs/TROUBLESHOOTING.md.
+#
+# Оставлен как запасной вариант на случай, если lingering недоступен. Если
+# ставите его — сначала погасите штатный:
+#   systemctl --user stop hermes-gateway
+#   systemctl --user disable hermes-gateway
+
 [Unit]
 Description=Hermes Agent Telegram Gateway
 After=network-online.target docker.service

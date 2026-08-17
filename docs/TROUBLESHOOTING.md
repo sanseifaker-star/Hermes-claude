@@ -14,27 +14,49 @@ WARNING hermes_cli.gateway: Gateway (re)started 7 times in 120s — backing off 
 `ps -ef --forest` не находит второго процесса — потому что нарушитель живёт
 миллисекунды и умирает до того, как вы успеете его снять.
 
-**Причина.** Hermes при установке ставит **пользовательский** systemd-юнит
-(`systemctl --user`), а мы поверх завели одноимённый **системный**. Два юнита
-с одинаковым именем `hermes-gateway.service`, но в разных пространствах:
+**Причина — самодельный системный юнит.** У Hermes есть штатная команда
+`hermes gateway install`, которая ставит **пользовательский** сервис
+(`systemctl --user`, логи через `journalctl --user -u hermes-gateway`). Если
+поверх завести свой **системный** юнит с тем же именем, получаются два юнита
+в разных пространствах:
 
-- системный — `/etc/systemd/system/`, описание «Hermes Agent Telegram Gateway»
-- пользовательский — `~/.config/systemd/user/`, описание
+- пользовательский, штатный — `~/.config/systemd/user/`,
   «Hermes Agent Gateway - Messaging Platform Integration»
+- системный, самодельный — `/etc/systemd/system/`,
+  «Hermes Agent Telegram Gateway»
 
-Системный захватывает блокировку, пользовательский бесконечно ломится за ней.
+Один захватывает блокировку шлюза, второй бесконечно ломится за ней.
 
 **Диагностика.** `grep -rl hermes /etc/systemd/system/` покажет только
-системные юниты и создаст ложное ощущение, что всё чисто. Смотреть надо:
+системные юниты и создаст ложное ощущение, что всё чисто. Смотреть надо оба
+пространства:
 ```bash
 systemctl --user list-units --no-pager
+grep -rl hermes /etc/systemd/system/
 ```
 
-**Решение.** Оставить системный (стартует при загрузке независимо от сессий),
-погасить пользовательский:
+**Решение — не городить свой юнит.** Использовать штатный механизм:
 ```bash
-systemctl --user stop hermes-gateway
-systemctl --user disable hermes-gateway
+hermes gateway install
+hermes gateway start
+hermes gateway status
+```
+
+Единственная причина, по которой хочется системный юнит — пользовательские
+сервисы не стартуют, пока пользователь не вошёл в систему, то есть не
+переживают перезагрузку. Это решается не своим юнитом, а lingering:
+```bash
+loginctl enable-linger root
+```
+
+Если самодельный юнит уже стоит — снести его и вернуться на штатный:
+```bash
+systemctl stop hermes-gateway
+systemctl disable hermes-gateway
+rm /etc/systemd/system/hermes-gateway.service
+systemctl daemon-reload
+hermes gateway install
+loginctl enable-linger root
 ```
 
 ## Playwright: «does not support chromium on ubuntu26.04-x64»
